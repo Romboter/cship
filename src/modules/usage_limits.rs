@@ -11,6 +11,115 @@ use crate::config::{CshipConfig, UsageLimitsConfig};
 use crate::context::Context;
 use crate::usage_limits::UsageLimitsData;
 
+/// A single window's percentage + reset, tagged with which source produced it.
+/// Reset and percentage always travel together so a merge can never pair one
+/// source's pct with another source's reset (the bug this type exists to prevent).
+#[derive(Debug, Clone, PartialEq)]
+struct UsageWindowSnapshot {
+    pct: f64,
+    resets_at_epoch: Option<u64>,
+    resets_at_iso: String,
+}
+
+impl UsageWindowSnapshot {
+    fn new(pct: f64, epoch: Option<u64>, iso: &str) -> Self {
+        let resets_at_epoch = resolve_epoch(epoch, iso);
+        Self {
+            pct,
+            resets_at_epoch,
+            resets_at_iso: iso.to_string(),
+        }
+    }
+}
+
+/// Result of merging a stdin and an API window snapshot for one period (5h or 7d).
+#[derive(Debug, Clone, PartialEq, Default)]
+struct MergedUsageWindow {
+    pct: f64,
+    resets_at_epoch: Option<u64>,
+    resets_at_iso: String,
+}
+
+impl MergedUsageWindow {
+    fn empty() -> Self {
+        Self::default()
+    }
+}
+
+impl From<&UsageWindowSnapshot> for MergedUsageWindow {
+    fn from(s: &UsageWindowSnapshot) -> Self {
+        Self {
+            pct: s.pct,
+            resets_at_epoch: s.resets_at_epoch,
+            resets_at_iso: s.resets_at_iso.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowState {
+    Live,
+    Expired,
+    Unknown,
+}
+
+fn classify_window(snapshot: &UsageWindowSnapshot, now: u64) -> WindowState {
+    match snapshot.resets_at_epoch {
+        Some(e) if e > now => WindowState::Live,
+        Some(_) => WindowState::Expired,
+        None => WindowState::Unknown,
+    }
+}
+
+/// Same-window tolerance: reset timestamps within this many seconds of each
+/// other are treated as the same underlying window (clock/rounding slop
+/// between stdin's epoch and the API's ISO-parsed epoch).
+const SAME_WINDOW_TOLERANCE_SECS: u64 = 60;
+
+/// Merge a stdin and an API window snapshot for one period into a single
+/// authoritative percentage + reset pair. See module docs / plan doc for the
+/// full decision table (Phase 1, "Required Merge Rules").
+fn merge_window(
+    stdin: Option<UsageWindowSnapshot>,
+    api: Option<UsageWindowSnapshot>,
+    now: u64,
+) -> MergedUsageWindow {
+    let stdin_state = stdin.as_ref().map(|s| classify_window(s, now));
+    let api_state = api.as_ref().map(|s| classify_window(s, now));
+
+    match (&stdin, stdin_state, &api, api_state) {
+        (Some(s), Some(WindowState::Live), Some(a), Some(WindowState::Live)) => {
+            let s_reset = s.resets_at_epoch.unwrap();
+            let a_reset = a.resets_at_epoch.unwrap();
+            if s_reset.abs_diff(a_reset) <= SAME_WINDOW_TOLERANCE_SECS {
+                if a.pct >= s.pct { a.into() } else { s.into() }
+            } else if a_reset > s_reset {
+                a.into()
+            } else {
+                s.into()
+            }
+        }
+        (Some(s), Some(WindowState::Live), _, _) => s.into(),
+        (_, _, Some(a), Some(WindowState::Live)) => a.into(),
+        // API's unknown-reset pct is preferred over stdin's (API is account-wide),
+        // so check it first — both arms produce the same shape, so one helper
+        // covers "whichever side is Unknown" instead of two near-identical arms.
+        (_, _, Some(a), Some(WindowState::Unknown)) => unknown_result(a.pct),
+        (Some(s), Some(WindowState::Unknown), _, _) => unknown_result(s.pct),
+        _ => MergedUsageWindow::empty(),
+    }
+}
+
+/// A pct with no trustworthy reset time attached — used whenever the
+/// selected source's window state is `Unknown`.
+fn unknown_result(pct: f64) -> MergedUsageWindow {
+    MergedUsageWindow {
+        pct,
+        resets_at_epoch: None,
+        resets_at_iso: String::new(),
+    }
+}
+
 thread_local! {
     /// Per-render-cycle memo for `resolve_data`. cship invocations are short-lived
     /// (one process per prompt render), so a thread-local cache effectively means
@@ -109,20 +218,47 @@ fn resolve_data_uncached(ctx: &Context, cfg: &CshipConfig) -> Option<UsageLimits
         }
     });
 
+    let now = now_epoch();
     match (stdin_data, full_data) {
-        // Merge: stdin 5h/7d (fresh) + cache/OAuth per-model/extra
-        (Some(stdin), Some(full)) => Some(UsageLimitsData {
-            five_hour_pct: stdin.five_hour_pct,
-            seven_day_pct: stdin.seven_day_pct,
-            five_hour_resets_at_epoch: stdin.five_hour_resets_at_epoch,
-            seven_day_resets_at_epoch: stdin.seven_day_resets_at_epoch,
-            ..full
-        }),
-        // Stdin only (no per-model/extra)
+        (Some(stdin), Some(full)) => {
+            let five_h = merge_window(
+                Some(UsageWindowSnapshot::new(
+                    stdin.five_hour_pct,
+                    stdin.five_hour_resets_at_epoch,
+                    &stdin.five_hour_resets_at,
+                )),
+                Some(UsageWindowSnapshot::new(
+                    full.five_hour_pct,
+                    full.five_hour_resets_at_epoch,
+                    &full.five_hour_resets_at,
+                )),
+                now,
+            );
+            let seven_d = merge_window(
+                Some(UsageWindowSnapshot::new(
+                    stdin.seven_day_pct,
+                    stdin.seven_day_resets_at_epoch,
+                    &stdin.seven_day_resets_at,
+                )),
+                Some(UsageWindowSnapshot::new(
+                    full.seven_day_pct,
+                    full.seven_day_resets_at_epoch,
+                    &full.seven_day_resets_at,
+                )),
+                now,
+            );
+            Some(UsageLimitsData {
+                five_hour_pct: five_h.pct,
+                seven_day_pct: seven_d.pct,
+                five_hour_resets_at: five_h.resets_at_iso,
+                seven_day_resets_at: seven_d.resets_at_iso,
+                five_hour_resets_at_epoch: five_h.resets_at_epoch,
+                seven_day_resets_at_epoch: seven_d.resets_at_epoch,
+                ..full
+            })
+        }
         (Some(stdin), None) => Some(stdin),
-        // No stdin, use cache/OAuth data as-is
         (None, Some(full)) => Some(full),
-        // Nothing available
         (None, None) => None,
     }
 }
@@ -157,6 +293,10 @@ fn fetch_and_cache(
 /// the API returns these fields as `null`, so they remain at default values
 /// after `parse_api_response`. Used to switch the renderer into "extra-usage
 /// only" mode.
+///
+/// Safe to check these four fields directly because `resolve_data_uncached`'s
+/// merge always produces a pct/epoch/iso triple from a single source — never
+/// a pct from one source paired with a reset from another.
 pub(crate) fn lacks_standard_signal(data: &UsageLimitsData) -> bool {
     data.five_hour_pct == 0.0
         && data.seven_day_pct == 0.0
@@ -2377,6 +2517,14 @@ mod tests {
             .map(|t| crate::platform::token_fingerprint(&t))
     }
 
+    fn epoch_to_iso_for_test(epoch: u64) -> String {
+        let secs = epoch as i64;
+        let days = secs.div_euclid(86_400);
+        let time_secs = secs.rem_euclid(86_400);
+        let dt = chrono::DateTime::from_timestamp(days * 86_400 + time_secs, 0).unwrap();
+        dt.format("%Y-%m-%dT%H:%M:%S+00:00").to_string()
+    }
+
     #[test]
     fn test_render_enterprise_extra_usage_only() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2424,5 +2572,172 @@ mod tests {
         };
         let cfg = CshipConfig::default();
         assert!(render(&ctx, &cfg).is_none());
+    }
+
+    #[test]
+    fn test_render_uses_live_api_pct_over_expired_stdin_no_now_in_output() {
+        let ctx = Context {
+            rate_limits: Some(crate::context::RateLimits {
+                five_hour: Some(crate::context::RateLimitPeriod {
+                    used_percentage: Some(85.0),
+                    resets_at: Some(now_epoch().saturating_sub(10)), // expired
+                }),
+                seven_day: Some(crate::context::RateLimitPeriod {
+                    used_percentage: Some(85.0),
+                    resets_at: Some(now_epoch().saturating_sub(10)),
+                }),
+            }),
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let transcript_path = dir.path().join("session.jsonl");
+        std::fs::write(&transcript_path, "").unwrap();
+        let mut ctx = ctx;
+        ctx.transcript_path = Some(transcript_path.to_string_lossy().to_string());
+
+        let live_reset = now_epoch() + 3600;
+        let mut api_data = UsageLimitsData {
+            five_hour_pct: 12.0,
+            seven_day_pct: 12.0,
+            five_hour_resets_at: epoch_to_iso_for_test(live_reset),
+            seven_day_resets_at: epoch_to_iso_for_test(live_reset),
+            ..Default::default()
+        };
+        let fp = current_fingerprint();
+        cache::write_usage_limits(&transcript_path, &api_data, 300, fp.as_deref());
+        api_data.five_hour_pct = 12.0; // silence unused-mut style warnings if refactored later
+
+        let cfg = CshipConfig::default();
+        let out = render(&ctx, &cfg).unwrap();
+        assert!(out.contains("12%"), "expected live API pct 12, got: {out}");
+        assert!(!out.contains("85%"), "expired stdin pct must not appear: {out}");
+        assert!(!out.contains("resets in now"), "must not resurrect expired reset: {out}");
+    }
+
+    // --- merge_window: Phase 1 window-merge correctness ---
+
+    fn snap(pct: f64, epoch: Option<u64>) -> UsageWindowSnapshot {
+        UsageWindowSnapshot::new(pct, epoch, "")
+    }
+
+    #[test]
+    fn test_merge_window_stdin_expired_api_live() {
+        let now = 1_000_000;
+        let stdin = snap(85.0, Some(now - 10)); // expired
+        let api = snap(12.0, Some(now + 10)); // live
+        let merged = merge_window(Some(stdin), Some(api), now);
+        assert_eq!(merged.pct, 12.0);
+        assert_eq!(merged.resets_at_epoch, Some(now + 10));
+    }
+
+    #[test]
+    fn test_merge_window_api_expired_stdin_live() {
+        let now = 1_000_000;
+        let stdin = snap(30.0, Some(now + 10));
+        let api = snap(70.0, Some(now - 10));
+        let merged = merge_window(Some(stdin), Some(api), now);
+        assert_eq!(merged.pct, 30.0);
+        assert_eq!(merged.resets_at_epoch, Some(now + 10));
+    }
+
+    #[test]
+    fn test_merge_window_both_live_same_reset_api_higher() {
+        let now = 1_000_000;
+        let reset = now + 500;
+        let stdin = snap(23.0, Some(reset));
+        let api = snap(60.0, Some(reset));
+        let merged = merge_window(Some(stdin), Some(api), now);
+        assert_eq!(merged.pct, 60.0);
+        assert_eq!(merged.resets_at_epoch, Some(reset));
+    }
+
+    #[test]
+    fn test_merge_window_both_live_same_reset_stdin_higher() {
+        let now = 1_000_000;
+        let reset = now + 500;
+        let stdin = snap(60.0, Some(reset));
+        let api = snap(23.0, Some(reset));
+        let merged = merge_window(Some(stdin), Some(api), now);
+        assert_eq!(merged.pct, 60.0);
+        assert_eq!(merged.resets_at_epoch, Some(reset));
+    }
+
+    #[test]
+    fn test_merge_window_both_live_different_reset_uses_later_reset_window() {
+        let now = 1_000_000;
+        let stdin = snap(85.0, Some(now + 100)); // earlier reset, older window
+        let api = snap(12.0, Some(now + 10_000)); // later reset, newer window
+        let merged = merge_window(Some(stdin), Some(api), now);
+        assert_eq!(merged.pct, 12.0);
+        assert_eq!(merged.resets_at_epoch, Some(now + 10_000));
+    }
+
+    #[test]
+    fn test_merge_window_both_expired_returns_zero_with_no_reset() {
+        let now = 1_000_000;
+        let stdin = snap(85.0, Some(now - 100));
+        let api = snap(70.0, Some(now - 50));
+        let merged = merge_window(Some(stdin), Some(api), now);
+        assert_eq!(merged.pct, 0.0);
+        assert_eq!(merged.resets_at_epoch, None);
+        assert!(merged.resets_at_iso.is_empty());
+    }
+
+    #[test]
+    fn test_merge_window_api_unknown_reset_stdin_expired_prefers_api() {
+        let now = 1_000_000;
+        let stdin = snap(85.0, Some(now - 100)); // expired
+        let api = snap(40.0, None); // unknown reset
+        let merged = merge_window(Some(stdin), Some(api), now);
+        assert_eq!(merged.pct, 40.0);
+        assert_eq!(merged.resets_at_epoch, None);
+    }
+
+    #[test]
+    fn test_merge_window_stdin_unknown_reset_api_live_prefers_api() {
+        let now = 1_000_000;
+        let stdin = snap(90.0, None); // unknown reset
+        let api = snap(15.0, Some(now + 10)); // live
+        let merged = merge_window(Some(stdin), Some(api), now);
+        assert_eq!(merged.pct, 15.0);
+        assert_eq!(merged.resets_at_epoch, Some(now + 10));
+    }
+
+    #[test]
+    fn test_merge_window_only_stdin_present_unknown_reset() {
+        let now = 1_000_000;
+        let stdin = snap(50.0, None);
+        let merged = merge_window(Some(stdin), None, now);
+        assert_eq!(merged.pct, 50.0);
+        assert_eq!(merged.resets_at_epoch, None);
+    }
+
+    #[test]
+    fn test_merge_window_percentage_and_reset_always_paired() {
+        // Regression guard for the exact bug in the deleted branch: selecting
+        // API's pct must never pair with stdin's reset epoch or vice versa.
+        let now = 1_000_000;
+        let stdin = UsageWindowSnapshot::new(85.0, Some(now - 10), "2020-01-01T00:00:00+00:00");
+        let api = UsageWindowSnapshot::new(12.0, Some(now + 10), "2099-01-01T00:00:00+00:00");
+        let merged = merge_window(Some(stdin), Some(api), now);
+        assert_eq!(merged.pct, 12.0);
+        assert_eq!(merged.resets_at_iso, "2099-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn test_format_output_zero_pct_never_renders_resets_in_now() {
+        let data = UsageLimitsData {
+            five_hour_pct: 0.0,
+            seven_day_pct: 0.0,
+            five_hour_resets_at: String::new(),
+            seven_day_resets_at: String::new(),
+            five_hour_resets_at_epoch: None,
+            seven_day_resets_at_epoch: None,
+            ..Default::default()
+        };
+        let cfg = UsageLimitsConfig::default();
+        let out = format_output(&data, &cfg);
+        assert!(!out.contains("resets in now"), "got: {out}");
+        assert!(out.contains("0%"), "got: {out}");
     }
 }
