@@ -244,9 +244,298 @@ pub(crate) fn try_acquire_fetch_lock() -> Option<FetchLock> {
     try_acquire_fetch_lock_in(&dir)
 }
 
+// =============================================================================
+// Fetch eligibility, backoff, and outcome-driven state transitions
+// =============================================================================
+
+const DEFAULT_API_INTERVAL_SECS: u64 = 180;
+const MIN_API_INTERVAL_SECS: u64 = 180;
+const MAX_RATE_LIMIT_BACKOFF_SECS: u64 = 900;
+const TRANSIENT_ERROR_RETRY_SECS: u64 = 30;
+const RESET_CONFIRMATION_BUFFER_SECS: u64 = 5;
+
+fn fetch_may_be_needed(state: &SharedUsageState, fingerprint: &str, now: u64) -> bool {
+    if state.failed_token_fingerprint.as_deref() == Some(fingerprint) {
+        return false;
+    }
+    if now < state.rate_limit_until_epoch {
+        return false;
+    }
+    now >= state.next_allowed_at_epoch
+}
+
+fn effective_interval(configured_ttl: Option<u64>) -> u64 {
+    configured_ttl
+        .unwrap_or(DEFAULT_API_INTERVAL_SECS)
+        .max(MIN_API_INTERVAL_SECS)
+}
+
+/// Earliest future reset epoch present in a usage snapshot, if any — used to
+/// avoid scheduling the next poll for a moment just before a known reset
+/// when waiting a few extra seconds would let that same poll confirm the
+/// new window instead.
+fn earliest_future_reset(data: &UsageLimitsData, now: u64) -> Option<u64> {
+    [
+        crate::cache::iso8601_to_epoch(&data.five_hour_resets_at),
+        crate::cache::iso8601_to_epoch(&data.seven_day_resets_at),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|&e| e > now)
+    .min()
+}
+
+/// Exponential backoff shared by every "keep failing, wait longer" outcome:
+/// `base * 2^(consecutive_errors - 1)`, capped at `cap`. One formula, fed
+/// different `base`/`cap` pairs per outcome, instead of two near-identical
+/// hand-rolled versions (one for 429s, one for 5xx).
+fn backoff_secs(base: u64, consecutive_errors: u32, cap: u64) -> u64 {
+    let exponent = consecutive_errors.saturating_sub(1).min(10);
+    base.saturating_mul(1_u64 << exponent).min(cap)
+}
+
+fn apply_fetch_outcome(
+    state: &mut SharedUsageState,
+    outcome: crate::usage_limits::UsageFetchOutcome,
+    now: u64,
+    api_interval: u64,
+) {
+    use crate::usage_limits::UsageFetchOutcome;
+    match outcome {
+        UsageFetchOutcome::Success(data) => {
+            let reset = earliest_future_reset(&data, now);
+            state.usage = Some(data);
+            let ordinary_next = now + api_interval;
+            state.next_allowed_at_epoch = match reset {
+                Some(r)
+                    if r + RESET_CONFIRMATION_BUFFER_SECS > now
+                        && r + RESET_CONFIRMATION_BUFFER_SECS < ordinary_next + api_interval =>
+                {
+                    ordinary_next.max(r + RESET_CONFIRMATION_BUFFER_SECS)
+                }
+                _ => ordinary_next,
+            };
+            state.rate_limit_until_epoch = 0;
+            state.consecutive_errors = 0;
+            state.failed_token_fingerprint = None;
+        }
+        UsageFetchOutcome::RateLimited {
+            retry_after_seconds,
+        } => {
+            state.consecutive_errors = state.consecutive_errors.saturating_add(1);
+            let delay = retry_after_seconds
+                .map(|retry_after| {
+                    retry_after
+                        .max(api_interval)
+                        .min(MAX_RATE_LIMIT_BACKOFF_SECS)
+                })
+                .unwrap_or_else(|| {
+                    backoff_secs(
+                        api_interval,
+                        state.consecutive_errors,
+                        MAX_RATE_LIMIT_BACKOFF_SECS,
+                    )
+                });
+            state.rate_limit_until_epoch = now + delay;
+            state.next_allowed_at_epoch = state.rate_limit_until_epoch;
+        }
+        UsageFetchOutcome::Unauthorized => {
+            if let Some(fp) = state.token_fingerprint.clone() {
+                state.failed_token_fingerprint = Some(fp);
+            }
+            state.next_allowed_at_epoch = now + TRANSIENT_ERROR_RETRY_SECS;
+        }
+        UsageFetchOutcome::NetworkError | UsageFetchOutcome::InvalidResponse => {
+            state.consecutive_errors = state.consecutive_errors.saturating_add(1);
+            state.next_allowed_at_epoch = now + TRANSIENT_ERROR_RETRY_SECS;
+        }
+        UsageFetchOutcome::ServerError { .. } => {
+            state.consecutive_errors = state.consecutive_errors.saturating_add(1);
+            let delay = backoff_secs(TRANSIENT_ERROR_RETRY_SECS, state.consecutive_errors, 300);
+            state.next_allowed_at_epoch = now + delay;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage_limits::UsageLimitsData;
+
+    fn default_state_at(now: u64) -> SharedUsageState {
+        let mut s = SharedUsageState::default_v2();
+        s.next_allowed_at_epoch = now; // eligible immediately unless overridden
+        s
+    }
+
+    #[test]
+    fn test_fetch_eligible_when_next_allowed_in_past() {
+        let now = 2_000_000;
+        let mut state = default_state_at(now);
+        state.next_allowed_at_epoch = now - 1;
+        assert!(fetch_may_be_needed(&state, "fp-1", now));
+    }
+
+    #[test]
+    fn test_fetch_not_eligible_before_next_allowed() {
+        let now = 2_000_000;
+        let mut state = default_state_at(now);
+        state.next_allowed_at_epoch = now + 100;
+        assert!(!fetch_may_be_needed(&state, "fp-1", now));
+    }
+
+    #[test]
+    fn test_fetch_not_eligible_during_rate_limit_cooldown() {
+        let now = 2_000_000;
+        let mut state = default_state_at(now);
+        state.next_allowed_at_epoch = now - 1;
+        state.rate_limit_until_epoch = now + 500;
+        assert!(!fetch_may_be_needed(&state, "fp-1", now));
+    }
+
+    #[test]
+    fn test_fetch_not_eligible_when_token_is_failed_fingerprint() {
+        let now = 2_000_000;
+        let mut state = default_state_at(now);
+        state.next_allowed_at_epoch = now - 1;
+        state.failed_token_fingerprint = Some("fp-1".to_string());
+        assert!(!fetch_may_be_needed(&state, "fp-1", now));
+    }
+
+    #[test]
+    fn test_fetch_eligible_when_failed_fingerprint_is_a_different_token() {
+        let now = 2_000_000;
+        let mut state = default_state_at(now);
+        state.next_allowed_at_epoch = now - 1;
+        state.failed_token_fingerprint = Some("fp-old".to_string());
+        assert!(fetch_may_be_needed(&state, "fp-new", now));
+    }
+
+    #[test]
+    fn test_apply_success_outcome_clears_backoff_and_sets_next_allowed() {
+        let now = 2_000_000;
+        let mut state = default_state_at(now);
+        state.consecutive_errors = 3;
+        state.rate_limit_until_epoch = now + 900;
+        let data = UsageLimitsData::default();
+        apply_fetch_outcome(
+            &mut state,
+            crate::usage_limits::UsageFetchOutcome::Success(data),
+            now,
+            180,
+        );
+        assert_eq!(state.consecutive_errors, 0);
+        assert_eq!(state.rate_limit_until_epoch, 0);
+        assert_eq!(state.next_allowed_at_epoch, now + 180);
+        assert!(state.usage.is_some());
+    }
+
+    #[test]
+    fn test_apply_rate_limited_outcome_honors_retry_after_within_bounds() {
+        let now = 2_000_000;
+        let mut state = default_state_at(now);
+        apply_fetch_outcome(
+            &mut state,
+            crate::usage_limits::UsageFetchOutcome::RateLimited {
+                retry_after_seconds: Some(400),
+            },
+            now,
+            180,
+        );
+        assert_eq!(state.rate_limit_until_epoch, now + 400);
+        assert_eq!(state.next_allowed_at_epoch, now + 400);
+    }
+
+    #[test]
+    fn test_apply_rate_limited_outcome_clamps_retry_after_below_interval_up_to_interval() {
+        let now = 2_000_000;
+        let mut state = default_state_at(now);
+        apply_fetch_outcome(
+            &mut state,
+            crate::usage_limits::UsageFetchOutcome::RateLimited {
+                retry_after_seconds: Some(30),
+            },
+            now,
+            180,
+        );
+        assert_eq!(state.rate_limit_until_epoch, now + 180);
+    }
+
+    #[test]
+    fn test_apply_rate_limited_outcome_caps_retry_after_at_900() {
+        let now = 2_000_000;
+        let mut state = default_state_at(now);
+        apply_fetch_outcome(
+            &mut state,
+            crate::usage_limits::UsageFetchOutcome::RateLimited {
+                retry_after_seconds: Some(5000),
+            },
+            now,
+            180,
+        );
+        assert_eq!(state.rate_limit_until_epoch, now + 900);
+    }
+
+    #[test]
+    fn test_apply_rate_limited_outcome_missing_retry_after_uses_exponential_backoff() {
+        let now = 2_000_000;
+        let mut state = default_state_at(now);
+        state.consecutive_errors = 2; // this will become the 3rd consecutive error
+        apply_fetch_outcome(
+            &mut state,
+            crate::usage_limits::UsageFetchOutcome::RateLimited {
+                retry_after_seconds: None,
+            },
+            now,
+            180,
+        );
+        // exponent = consecutive_errors.saturating_sub(1).min(10) using the
+        // POST-increment count (3 - 1 = 2) => 180 * 2^2 = 720
+        assert_eq!(state.rate_limit_until_epoch, now + 720);
+    }
+
+    #[test]
+    fn test_apply_network_error_keeps_previous_snapshot_and_retries_in_30s() {
+        let now = 2_000_000;
+        let mut state = default_state_at(now);
+        state.usage = Some(UsageLimitsData {
+            five_hour_pct: 42.0,
+            ..Default::default()
+        });
+        apply_fetch_outcome(
+            &mut state,
+            crate::usage_limits::UsageFetchOutcome::NetworkError,
+            now,
+            180,
+        );
+        assert_eq!(state.usage.as_ref().unwrap().five_hour_pct, 42.0);
+        assert_eq!(state.next_allowed_at_epoch, now + 30);
+    }
+
+    #[test]
+    fn test_apply_unauthorized_outcome_sets_failed_token_fingerprint() {
+        let now = 2_000_000;
+        let mut state = default_state_at(now);
+        state.token_fingerprint = Some("fp-current".to_string());
+        apply_fetch_outcome(
+            &mut state,
+            crate::usage_limits::UsageFetchOutcome::Unauthorized,
+            now,
+            180,
+        );
+        assert_eq!(
+            state.failed_token_fingerprint,
+            Some("fp-current".to_string())
+        );
+    }
+
+    #[test]
+    fn test_backoff_secs_doubles_per_error_and_caps() {
+        assert_eq!(backoff_secs(180, 1, 900), 180); // 180 * 2^0
+        assert_eq!(backoff_secs(180, 2, 900), 360); // 180 * 2^1
+        assert_eq!(backoff_secs(180, 3, 900), 720); // 180 * 2^2
+        assert_eq!(backoff_secs(180, 4, 900), 900); // 180 * 2^3 = 1440, capped
+    }
 
     #[test]
     fn test_load_state_or_default_when_file_missing_returns_schema_v2_default() {
