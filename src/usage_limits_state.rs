@@ -108,12 +108,12 @@ fn persist_state_to_dir(dir: &Path, state: &SharedUsageState) {
         Ok(())
     })();
     if let Err(e) = write_result {
-        tracing::debug!("cship.usage_limits_state: failed to write temp state file: {e}");
+        tracing::warn!("cship.usage_limits_state: failed to write temp state file: {e}");
         let _ = std::fs::remove_file(&tmp_path);
         return;
     }
     if let Err(e) = std::fs::rename(&tmp_path, state_file_path_in(dir)) {
-        tracing::debug!("cship.usage_limits_state: failed to replace state file: {e}");
+        tracing::warn!("cship.usage_limits_state: failed to replace state file: {e}");
         let _ = std::fs::remove_file(&tmp_path);
     }
     set_restrictive_permissions(&state_file_path_in(dir));
@@ -165,11 +165,54 @@ pub(crate) struct FetchLock {
     _file: std::fs::File,
 }
 
+impl FetchLock {
+    /// Bumps the lock file's mtime to record "a fetch was just attempted",
+    /// independent of whether `persist_state` succeeds afterward. See
+    /// `fetch_recently_touched` for why this matters.
+    fn touch(&self) {
+        let _ = self._file.set_modified(std::time::SystemTime::now());
+    }
+}
+
+fn lock_path_in(dir: &Path) -> PathBuf {
+    dir.join(LOCK_FILE_NAME)
+}
+
+/// Backstop fetch-eligibility check, independent of `SharedUsageState`: true
+/// if the lock file was touched within `interval` seconds of `now`.
+///
+/// `persist_state` can silently fail to durably record a completed fetch
+/// (read-only/unavailable cache dir, a rename blocked by an AV scanner or a
+/// sync client holding the target file open, ...). When that happens the
+/// state file itself under-reports how recently a fetch actually ran, so
+/// `fetch_may_be_needed` alone would judge every render eligible again —
+/// hammering the API on every statusline render instead of respecting
+/// `interval`. `FetchLock::touch` bumps the lock file's mtime whenever a
+/// fetch completes, regardless of persist success; a metadata-only update is
+/// far more likely to survive whatever is blocking the state file's atomic
+/// rename, so this check protects the throttle even when state persistence
+/// itself is degraded.
+fn fetch_recently_touched(dir: &Path, interval: u64, now: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(lock_path_in(dir)) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    let Ok(mtime_epoch) = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+    else {
+        return false; // mtime before 1970 — shouldn't happen, don't block on it
+    };
+    now.saturating_sub(mtime_epoch) < interval
+}
+
 fn try_acquire_fetch_lock_in(dir: &Path) -> Option<FetchLock> {
     if std::fs::create_dir_all(dir).is_err() {
         return None;
     }
-    let lock_path = dir.join(LOCK_FILE_NAME);
+    let lock_path = lock_path_in(dir);
     let file = match std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -188,11 +231,6 @@ fn try_acquire_fetch_lock_in(dir: &Path) -> Option<FetchLock> {
         Ok(()) => Some(FetchLock { _file: file }),
         Err(_) => None,
     }
-}
-
-pub(crate) fn try_acquire_fetch_lock() -> Option<FetchLock> {
-    let dir = crate::platform::cship_shared_cache_dir()?;
-    try_acquire_fetch_lock_in(&dir)
 }
 
 // =============================================================================
@@ -416,7 +454,8 @@ pub(crate) fn resolve_shared_usage(
         };
     }
 
-    let Some(_lock) = try_acquire_fetch_lock() else {
+    let dir = crate::platform::cship_shared_cache_dir();
+    let Some(_lock) = dir.as_deref().and_then(try_acquire_fetch_lock_in) else {
         return SharedUsageResolution {
             usage: displayable_usage(&state, &fingerprint),
         };
@@ -425,6 +464,25 @@ pub(crate) fn resolve_shared_usage(
     // Re-read: another process may have refreshed while we were acquiring.
     let mut state = load_state_or_default();
     let fresh_token_change = is_fresh_token_change(&state, &fingerprint);
+
+    let recently_touched = dir
+        .as_deref()
+        .is_some_and(|d| fetch_recently_touched(d, interval, now));
+
+    if recently_touched || (!fresh_token_change && !fetch_may_be_needed(&state, &fingerprint, now))
+    {
+        // Someone else already refreshed while we waited for the lock, or
+        // this fingerprint already burned its one bypass probe and is now
+        // just in normal backoff — or the state file under-reports how
+        // recently a fetch ran because persisting it is currently failing
+        // (see `fetch_recently_touched`). The recently-touched check applies
+        // even to a fresh token change: if persisting the probe's outcome
+        // failed, the lock mtime is still the backstop that stops it from
+        // re-firing on every render.
+        return SharedUsageResolution {
+            usage: displayable_usage(&state, &fingerprint),
+        };
+    }
 
     if fresh_token_change {
         // Points 3/4/5: the old failure block no longer applies to this
@@ -448,13 +506,6 @@ pub(crate) fn resolve_shared_usage(
         state.next_allowed_at_epoch = now;
         state.rate_limit_until_epoch = 0;
         state.consecutive_errors = 0;
-    } else if !fetch_may_be_needed(&state, &fingerprint, now) {
-        // Someone else already refreshed while we waited for the lock, or
-        // this fingerprint already burned its one bypass probe and is now
-        // just in normal backoff.
-        return SharedUsageResolution {
-            usage: displayable_usage(&state, &fingerprint),
-        };
     }
 
     // Recorded unconditionally, even if the state write below fails, so a
@@ -1141,5 +1192,91 @@ mod tests {
         // ...and the moment its handle closes, the OS releases the lock.
         drop(crashed_holder);
         assert!(try_acquire_fetch_lock_in(dir.path()).is_some());
+    }
+
+    #[test]
+    fn test_fetch_recently_touched_true_just_after_touch() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = try_acquire_fetch_lock_in(dir.path()).unwrap();
+        lock.touch();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(fetch_recently_touched(dir.path(), 60, now));
+    }
+
+    #[test]
+    fn test_fetch_recently_touched_false_once_interval_elapses() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = try_acquire_fetch_lock_in(dir.path()).unwrap();
+        lock.touch();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(!fetch_recently_touched(dir.path(), 60, now + 61));
+    }
+
+    #[test]
+    fn test_fetch_recently_touched_false_when_lock_file_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(!fetch_recently_touched(dir.path(), 60, now));
+    }
+
+    /// Regression test for the persist-failure amplification scenario: even
+    /// though `state.next_allowed_at_epoch` never advances (simulating a
+    /// cache dir where `persist_state` silently fails), a second render
+    /// within `interval` of the first must not be judged eligible, because
+    /// `fetch_recently_touched` catches what the (unwritable) state file
+    /// under-reports.
+    #[test]
+    fn test_fetch_recently_touched_blocks_reeligibility_despite_stale_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = try_acquire_fetch_lock_in(dir.path()).unwrap();
+        lock.touch();
+        drop(lock);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let state = SharedUsageState::default_v2(); // next_allowed_at_epoch stuck at 0
+        let interval = 60;
+
+        assert!(fetch_may_be_needed(&state, "fp-1", now)); // state alone says "go"
+        assert!(fetch_recently_touched(dir.path(), interval, now)); // backstop says "no"
+    }
+
+    /// Regression test for the fresh-token-change variant of the same
+    /// persist-failure amplification bug: a brand-new fingerprint is always
+    /// "fresh" per `is_fresh_token_change` until a probe is either committed
+    /// (success) or recorded (failure) — and if `persist_state` fails after
+    /// the probe, neither ever happens, so `is_fresh_token_change` reports
+    /// "still fresh" on every subsequent render. The lock mtime backstop
+    /// must still gate the fresh-token bypass, exactly like it gates the
+    /// ordinary `fetch_may_be_needed` path above.
+    #[test]
+    fn test_fetch_recently_touched_blocks_fresh_token_bypass_despite_stale_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = try_acquire_fetch_lock_in(dir.path()).unwrap();
+        lock.touch(); // simulates the unconditional touch() after a probe attempt
+        drop(lock);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // token_change_probe_fingerprint never got persisted, so the new
+        // fingerprint still reads as fresh.
+        let state = SharedUsageState::default_v2();
+        let interval = 60;
+
+        assert!(is_fresh_token_change(&state, "fp-new")); // state alone says "bypass"
+        assert!(fetch_recently_touched(dir.path(), interval, now)); // backstop says "no"
     }
 }
