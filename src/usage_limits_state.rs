@@ -3,8 +3,9 @@
 //! Every `cship` invocation is a separate short-lived process; multiple
 //! Claude Code sessions can invoke it at nearly the same time. This module
 //! makes those processes share one on-disk state file and one fetch lock so
-//! `/api/oauth/usage` is polled at most once per ~180s, globally, regardless
-//! of how many sessions or processes are running.
+//! `/api/oauth/usage` is polled at most once per interval (60s by default,
+//! user-configurable via `ttl`), globally, regardless of how many sessions or
+//! processes are running.
 //!
 //! This is the ONLY file that reads/writes the shared cross-process cache
 //! directory (`platform::cship_shared_cache_dir()`). It does not make HTTP
@@ -198,8 +199,7 @@ pub(crate) fn try_acquire_fetch_lock() -> Option<FetchLock> {
 // Fetch eligibility, backoff, and outcome-driven state transitions
 // =============================================================================
 
-const DEFAULT_API_INTERVAL_SECS: u64 = 180;
-const MIN_API_INTERVAL_SECS: u64 = 180;
+const DEFAULT_API_INTERVAL_SECS: u64 = 60;
 const MAX_RATE_LIMIT_BACKOFF_SECS: u64 = 900;
 const TRANSIENT_ERROR_RETRY_SECS: u64 = 30;
 const RESET_CONFIRMATION_BUFFER_SECS: u64 = 5;
@@ -227,10 +227,10 @@ fn is_fresh_token_change(state: &SharedUsageState, fingerprint: &str) -> bool {
         && state.token_change_probe_fingerprint.as_deref() != Some(fingerprint)
 }
 
+/// Defaults to 60s when unset. An explicit `ttl` is honored as-is, including
+/// values below 60 — the user has opted into more frequent polling.
 fn effective_interval(configured_ttl: Option<u64>) -> u64 {
-    configured_ttl
-        .unwrap_or(DEFAULT_API_INTERVAL_SECS)
-        .max(MIN_API_INTERVAL_SECS)
+    configured_ttl.unwrap_or(DEFAULT_API_INTERVAL_SECS)
 }
 
 /// Earliest future reset epoch present in a usage snapshot, if any — used to
@@ -389,7 +389,8 @@ where
 
 /// Coordinator's single public entry point: resolve account-wide OAuth usage
 /// data for the current token, fetching from the Anthropic API at most once
-/// per ~180s across all concurrent `cship` processes.
+/// per the configured interval (60s default) across all concurrent `cship`
+/// processes.
 ///
 /// Non-blocking: a process that can't acquire the fetch lock renders
 /// immediately from whatever's already on disk, never waits on another
@@ -594,6 +595,21 @@ mod tests {
             reacquired.is_some(),
             "lock must be released once the slow fetch actually completes"
         );
+    }
+
+    #[test]
+    fn test_effective_interval_defaults_to_60_when_unset() {
+        assert_eq!(effective_interval(None), 60);
+    }
+
+    #[test]
+    fn test_effective_interval_honors_configured_value_below_default() {
+        assert_eq!(effective_interval(Some(30)), 30);
+    }
+
+    #[test]
+    fn test_effective_interval_honors_configured_value_above_default() {
+        assert_eq!(effective_interval(Some(600)), 600);
     }
 
     #[test]

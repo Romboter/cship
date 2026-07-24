@@ -2,8 +2,9 @@
 //!
 //! Per-model + extra-usage data comes from the cross-process shared
 //! coordinator (`crate::usage_limits_state::resolve_shared_usage`), which
-//! fetches from the Anthropic API at most once per ~180s across all
-//! concurrent `cship` processes. This module only merges that with the
+//! fetches from the Anthropic API at most once per the configured interval
+//! (60s default, user-configurable via `ttl`) across all concurrent
+//! `cship` processes. This module only merges that with the
 //! freshest 5h/7d values from stdin and formats the result — it does not
 //! drive scheduling or HTTP calls itself.
 //!

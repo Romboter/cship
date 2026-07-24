@@ -331,8 +331,11 @@ pub struct UsageLimitsConfig {
     pub warn_style: Option<String>,
     pub critical_threshold: Option<f64>,
     pub critical_style: Option<String>,
-    /// Cache refresh interval in seconds. Default: 60.
-    /// Increase to reduce API pressure with many concurrent sessions.
+    /// Requested OAuth usage refresh interval, in seconds. Default: 60.
+    /// This is shared account-wide across every concurrent cship process
+    /// (via a cross-process coordinator), so running more sessions does not
+    /// multiply API calls. Increase to poll the API less often; decrease to
+    /// poll more often.
     pub ttl: Option<u64>,
     /// Reserved — not yet rendered. Use `five_hour_format`, `seven_day_format`,
     /// and `separator` for per-section format control.
@@ -577,8 +580,22 @@ fn load_from_path(path: &std::path::Path) -> anyhow::Result<CshipConfig> {
         .map_err(|e| anyhow::anyhow!("cannot read config file {}: {e}", path.display()))?;
     let wrapper: StarshipToml = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("malformed TOML in {}: {e}", path.display()))?;
+    let config = wrapper.cship.unwrap_or_default();
+    validate_config(&config)?;
     tracing::debug!("loaded config from {}", path.display());
-    Ok(wrapper.cship.unwrap_or_default())
+    Ok(config)
+}
+
+/// Rejects config values that would silently defeat a safety mechanism rather
+/// than just look weird — e.g. `usage_limits.ttl = 0` disables the shared
+/// fetch throttle entirely, letting every render issue a fresh OAuth request.
+fn validate_config(cfg: &CshipConfig) -> anyhow::Result<()> {
+    if cfg.usage_limits.as_ref().and_then(|c| c.ttl) == Some(0) {
+        anyhow::bail!(
+            "cship.usage_limits.ttl must be greater than 0 (0 would disable fetch throttling)"
+        );
+    }
+    Ok(())
 }
 
 /// Load `CshipConfig` from a dedicated `cship.toml` file at `path`.
@@ -595,12 +612,15 @@ fn load_cship_toml(path: &std::path::Path) -> anyhow::Result<CshipConfig> {
         tracing::debug!("loading cship.toml with [cship] section via wrapper");
         let wrapper: StarshipToml = toml::from_str(&content)
             .map_err(|e| anyhow::anyhow!("malformed TOML in {}: {e}", path.display()))?;
+        let config = wrapper.cship.unwrap_or_default();
+        validate_config(&config)?;
         tracing::debug!("loaded config from {} (via wrapper)", path.display());
-        return Ok(wrapper.cship.unwrap_or_default());
+        return Ok(config);
     }
     tracing::debug!("loading cship.toml in legacy wrapper-free format");
     let config: CshipConfig = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("malformed TOML in {}: {e}", path.display()))?;
+    validate_config(&config)?;
     tracing::debug!("loaded config from {}", path.display());
     Ok(config)
 }
@@ -680,6 +700,19 @@ mod tests {
             msg.contains("cannot read config file"),
             "error message: {msg}"
         );
+    }
+
+    #[test]
+    fn test_ttl_zero_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cship_path = dir.path().join("cship.toml");
+        let mut f = std::fs::File::create(&cship_path).unwrap();
+        writeln!(f, "[usage_limits]\nttl = 0").unwrap();
+
+        let result = discover_and_load(None, cship_path.to_str());
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("ttl"), "error message: {msg}");
     }
 
     #[test]

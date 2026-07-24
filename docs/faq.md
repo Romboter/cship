@@ -172,7 +172,7 @@ Set `end_hour = 24` to mean "through end of day". Weekends always return nothing
 - Run `cship explain` to confirm cship is receiving a valid JSON context.
 
 **Usage limits** data is cached:
-- Cache TTL: **configurable (default 60 seconds)**, or until the rate-limit reset window passes (whichever comes first). Set `[cship.usage_limits] ttl` to increase the cache interval if you run many concurrent sessions.
+- Cache TTL: **configurable (default 60 seconds)**, or until the rate-limit reset window passes (whichever comes first). This fetch is shared account-wide across every concurrent `cship` process, so running more sessions doesn't multiply API calls. Set `[cship.usage_limits] ttl` to poll more or less often.
 - The first call in a session always fetches fresh data; subsequent calls within the configured TTL return the cached value.
 - If the cache seems stale, check that your OAuth token is valid (re-login to Claude Code if needed).
 
