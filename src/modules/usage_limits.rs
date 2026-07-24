@@ -276,7 +276,18 @@ fn fetch_and_cache(
     let ttl_secs = ul_cfg.and_then(|c| c.ttl).unwrap_or(60);
     let fp = fingerprint.to_string();
 
-    match fetch_with_timeout(move || crate::usage_limits::fetch_usage_limits(&token)) {
+    match fetch_with_timeout(move || {
+        match crate::usage_limits::fetch_usage_limits(&token, None) {
+            crate::usage_limits::UsageFetchOutcome::Success(data) => Ok(data),
+            crate::usage_limits::UsageFetchOutcome::Unauthorized => Err("unauthorized".to_string()),
+            crate::usage_limits::UsageFetchOutcome::RateLimited { .. } => Err("rate limited".to_string()),
+            crate::usage_limits::UsageFetchOutcome::ServerError { status } => {
+                Err(format!("server error {status}"))
+            }
+            crate::usage_limits::UsageFetchOutcome::NetworkError => Err("network error".to_string()),
+            crate::usage_limits::UsageFetchOutcome::InvalidResponse => Err("invalid response".to_string()),
+        }
+    }) {
         Some(fresh) => {
             cache::write_usage_limits(transcript_path, &fresh, ttl_secs, Some(&fp));
             Some(fresh)

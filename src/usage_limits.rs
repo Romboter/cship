@@ -130,38 +130,159 @@ fn parse_api_response(json: &str) -> Result<UsageLimitsData, String> {
     })
 }
 
+/// Outcome of a single OAuth usage-limits fetch attempt. The caller
+/// (`usage_limits_state`) owns all retry/backoff scheduling — this module
+/// only classifies what happened on the wire.
+#[derive(Debug)]
+pub enum UsageFetchOutcome {
+    Success(UsageLimitsData),
+    Unauthorized,
+    RateLimited { retry_after_seconds: Option<u64> },
+    ServerError { status: u16 },
+    NetworkError,
+    InvalidResponse,
+}
+
+/// Parse an HTTP `Retry-After` header value as integer seconds. A malformed
+/// value is treated as absent (caller falls back to exponential backoff).
+fn parse_retry_after(header: Option<&str>) -> Option<u64> {
+    header.and_then(|h| h.parse::<u64>().ok())
+}
+
+/// Maps a completed response's status code (and `Retry-After` header, if any)
+/// to a terminal outcome, or `None` if the caller should proceed to read the
+/// success body (status 200).
+fn classify_status(status: u16, retry_after_header: Option<&str>) -> Option<UsageFetchOutcome> {
+    match status {
+        200 => None,
+        401 => Some(UsageFetchOutcome::Unauthorized),
+        429 => Some(UsageFetchOutcome::RateLimited {
+            retry_after_seconds: parse_retry_after(retry_after_header),
+        }),
+        s => Some(UsageFetchOutcome::ServerError { status: s }),
+    }
+}
+
 /// Fetch current usage limits from the Anthropic API.
-/// Returns structured usage data or a descriptive Err.
 /// This is the ONLY file in the codebase that makes external HTTP calls.
-pub fn fetch_usage_limits(token: &str) -> Result<UsageLimitsData, String> {
+/// Does not retry — the caller (`usage_limits_state`) owns retry/backoff scheduling.
+pub fn fetch_usage_limits(token: &str, claude_version: Option<&str>) -> UsageFetchOutcome {
     use std::time::Duration;
 
     let agent = ureq::Agent::new_with_config(
         ureq::config::Config::builder()
-            .timeout_global(Some(Duration::from_millis(1500)))
+            .timeout_global(Some(Duration::from_millis(5000)))
+            // ureq 3 defaults to treating any 4xx/5xx status as `Err`, which
+            // would make our status-code branches below unreachable — we need
+            // to inspect the response ourselves via `classify_status`.
+            .http_status_as_error(false)
             .build(),
     );
-    let mut response = agent
+    let user_agent = format!("claude-code/{}", claude_version.unwrap_or("unknown"));
+    let result = agent
         .get("https://api.anthropic.com/api/oauth/usage")
         .header("Authorization", &format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", &user_agent)
         .header("anthropic-beta", "oauth-2025-04-20")
-        .call()
-        .map_err(|e| format!("network error: {e}"))?;
+        .call();
 
-    if response.status() != 200 {
-        return Err(format!("API returned {}", response.status()));
+    let mut response = match result {
+        Ok(r) => r,
+        Err(_) => return UsageFetchOutcome::NetworkError,
+    };
+
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get("Retry-After")
+        .and_then(|v| v.to_str().ok());
+    if let Some(outcome) = classify_status(status, retry_after) {
+        return outcome;
     }
 
-    let body = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("failed to read response body: {e}"))?;
-    parse_api_response(&body)
+    let Ok(body) = response.body_mut().read_to_string() else {
+        return UsageFetchOutcome::InvalidResponse;
+    };
+    match parse_api_response(&body) {
+        Ok(data) => UsageFetchOutcome::Success(data),
+        Err(_) => UsageFetchOutcome::InvalidResponse,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_retry_after_seconds_present() {
+        assert_eq!(parse_retry_after(Some("120")), Some(120));
+    }
+
+    #[test]
+    fn test_parse_retry_after_malformed_is_none() {
+        assert_eq!(parse_retry_after(Some("not-a-number")), None);
+    }
+
+    #[test]
+    fn test_parse_retry_after_absent_is_none() {
+        assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn test_classify_status_200_returns_none() {
+        assert!(classify_status(200, None).is_none());
+    }
+
+    #[test]
+    fn test_classify_status_401_returns_unauthorized() {
+        assert!(matches!(
+            classify_status(401, None),
+            Some(UsageFetchOutcome::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn test_classify_status_429_with_retry_after_returns_rate_limited_with_seconds() {
+        match classify_status(429, Some("120")) {
+            Some(UsageFetchOutcome::RateLimited {
+                retry_after_seconds,
+            }) => assert_eq!(retry_after_seconds, Some(120)),
+            other => panic!("expected RateLimited with retry_after, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_status_429_without_retry_after_returns_rate_limited_with_none() {
+        match classify_status(429, None) {
+            Some(UsageFetchOutcome::RateLimited {
+                retry_after_seconds,
+            }) => assert_eq!(retry_after_seconds, None),
+            other => panic!("expected RateLimited with no retry_after, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_status_500_returns_server_error() {
+        match classify_status(500, None) {
+            Some(UsageFetchOutcome::ServerError { status }) => assert_eq!(status, 500),
+            other => panic!("expected ServerError{{500}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_status_other_non_success_returns_server_error() {
+        // 403/418 aren't 401 or 429 but still aren't success — must not be
+        // silently treated as a NetworkError or dropped.
+        match classify_status(403, None) {
+            Some(UsageFetchOutcome::ServerError { status }) => assert_eq!(status, 403),
+            other => panic!("expected ServerError{{403}}, got {other:?}"),
+        }
+        match classify_status(418, None) {
+            Some(UsageFetchOutcome::ServerError { status }) => assert_eq!(status, 418),
+            other => panic!("expected ServerError{{418}}, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_fetch_parses_extra_usage_fields() {
