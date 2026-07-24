@@ -15,8 +15,14 @@ use crate::usage_limits::UsageLimitsData;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const STATE_FILE_NAME: &str = "usage-limits-state-v2.json";
-const CURRENT_SCHEMA_VERSION: u32 = 2;
+// The filename's `-vN` suffix must be bumped in lockstep with
+// `CURRENT_SCHEMA_VERSION` whenever the schema changes. Different-schema
+// binaries then use separate files during a version rollout instead of
+// endlessly overwriting each other's state (which would defeat the fetch
+// throttle for the whole upgrade window). The compiler can't enforce this —
+// keep the two in sync by hand.
+const STATE_FILE_NAME: &str = "usage-limits-state-v3.json";
+const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SharedUsageState {
@@ -74,7 +80,7 @@ fn load_state_from_dir(dir: &Path) -> SharedUsageState {
     }
 }
 
-/// Atomically write `state` to `<dir>/usage-limits-state-v2.json`: serialize,
+/// Atomically write `state` to `<dir>/{STATE_FILE_NAME}`: serialize,
 /// write to a sibling temp file in the same directory, flush + fsync, then
 /// rename over the target. `fs::rename` is atomic on both POSIX and NTFS
 /// when source and destination are on the same volume (guaranteed here since
@@ -142,69 +148,20 @@ pub(crate) fn persist_state(state: &SharedUsageState) {
 }
 
 // =============================================================================
-// Cross-process fetch lock — non-blocking acquisition + stale recovery
+// Cross-process fetch lock — non-blocking OS-level advisory file lock
 // =============================================================================
 
 const LOCK_FILE_NAME: &str = "usage-limits-fetch.lock";
-const LOCK_STALE_AFTER_SECS: u64 = 15;
 
+/// Holds an OS-level advisory lock (`flock` on Unix, `LockFileEx` on
+/// Windows) on the shared lock file for the duration of a fetch. Mutual
+/// exclusion is kernel-enforced: only one process can hold the lock at a
+/// time, and if the holder crashes or is killed the OS releases the lock
+/// the moment its file descriptor closes — no staleness heuristic needed.
+/// Dropping the `File` releases the lock; the lock file itself is left in
+/// place (it's a permanent rendezvous point, not a token of ownership).
 pub(crate) struct FetchLock {
-    path: PathBuf,
-    token: String,
-}
-
-impl Drop for FetchLock {
-    fn drop(&mut self) {
-        // Only remove the lock file if it still holds the token *this*
-        // instance wrote. If another process reclaimed a stale lock while
-        // this instance stalled, the file now holds a different token — in
-        // that case the lock is no longer this instance's to delete, and
-        // deleting it anyway would let a third process acquire concurrently
-        // with the reclaiming owner. A read failure (file already gone, or
-        // truly unreadable) is also treated as "not mine to delete".
-        if let Ok(contents) = std::fs::read_to_string(&self.path)
-            && contents == self.token
-        {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// Generate a per-acquisition owner token unique enough to distinguish this
-/// process/attempt from any other: process ID + current time in nanoseconds.
-/// Only needs to be unlikely-to-collide among concurrent local processes, not
-/// cryptographically unique — no new dependency required.
-fn generate_owner_token() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{}-{}", std::process::id(), nanos)
-}
-
-fn try_create_lock_file(path: &Path, token: &str) -> bool {
-    use std::io::Write;
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut f) => f.write_all(token.as_bytes()).is_ok(),
-        Err(_) => false,
-    }
-}
-
-fn lock_is_stale(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return true; // unreadable lock file — treat as stale, safe to reclaim
-    };
-    let Ok(modified) = meta.modified() else {
-        return true; // platform doesn't support mtime — treat as stale
-    };
-    match std::time::SystemTime::now().duration_since(modified) {
-        Ok(age) => age.as_secs() > LOCK_STALE_AFTER_SECS,
-        Err(_) => false, // mtime is in the future (clock skew) — not stale
-    }
+    _file: std::fs::File,
 }
 
 fn try_acquire_fetch_lock_in(dir: &Path) -> Option<FetchLock> {
@@ -212,27 +169,24 @@ fn try_acquire_fetch_lock_in(dir: &Path) -> Option<FetchLock> {
         return None;
     }
     let lock_path = dir.join(LOCK_FILE_NAME);
-    let token = generate_owner_token();
-
-    if try_create_lock_file(&lock_path, &token) {
-        return Some(FetchLock {
-            path: lock_path,
-            token,
-        });
-    }
-
-    // Acquisition failed because the file exists. Recover a stale lock, then
-    // attempt exactly once more — never loop.
-    if lock_is_stale(&lock_path) {
-        let _ = std::fs::remove_file(&lock_path);
-        if try_create_lock_file(&lock_path, &token) {
-            return Some(FetchLock {
-                path: lock_path,
-                token,
-            });
+    let file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!("cship.usage_limits_state: could not open lock file: {e}");
+            return None;
         }
+    };
+    // Non-blocking: if another process holds the lock, give up immediately —
+    // callers are a statusline renderer that must never stall.
+    match file.try_lock() {
+        Ok(()) => Some(FetchLock { _file: file }),
+        Err(_) => None,
     }
-    None
 }
 
 pub(crate) fn try_acquire_fetch_lock() -> Option<FetchLock> {
@@ -355,7 +309,10 @@ fn apply_fetch_outcome(
             // that still holds the *previous* (uncommitted) fingerprint, so
             // reading it here would blame the wrong token.
             state.failed_token_fingerprint = Some(attempted_fingerprint.to_string());
-            state.next_allowed_at_epoch = now + TRANSIENT_ERROR_RETRY_SECS;
+            // No retry timer here: `fetch_may_be_needed` unconditionally
+            // blocks any fetch while `failed_token_fingerprint` matches the
+            // current token, so only a token change (different fingerprint)
+            // can unblock — a `next_allowed_at_epoch` bump would be inert.
         }
         UsageFetchOutcome::NetworkError | UsageFetchOutcome::InvalidResponse => {
             state.consecutive_errors = state.consecutive_errors.saturating_add(1);
@@ -398,12 +355,24 @@ const RENDER_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 /// `TRANSIENT_ERROR_RETRY_SECS`), instead of re-attempting the same slow
 /// endpoint on the very next render. Generic `F` bound allows tests to
 /// inject a fast lambda bypassing real HTTP.
-fn fetch_with_render_timeout<F>(fetch_fn: F) -> crate::usage_limits::UsageFetchOutcome
+/// `lock` is moved into the spawned thread rather than released by the
+/// caller: if the real request outlives the render timeout, the OS-level
+/// fetch lock must stay held for as long as the request is actually in
+/// flight, not just for as long as the render is willing to wait on it —
+/// otherwise another process can acquire the lock and start an overlapping
+/// request. The lock drops (and the rendezvous file is freed for the next
+/// fetch) whenever the thread actually finishes, bounded by the fetch
+/// function's own client-side timeout.
+fn fetch_with_render_timeout<F>(
+    fetch_fn: F,
+    lock: FetchLock,
+) -> crate::usage_limits::UsageFetchOutcome
 where
     F: FnOnce() -> crate::usage_limits::UsageFetchOutcome + Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let _lock = lock;
         let _ = tx.send(fetch_fn());
     });
     match rx.recv_timeout(RENDER_FETCH_TIMEOUT) {
@@ -487,11 +456,21 @@ pub(crate) fn resolve_shared_usage(
         };
     }
 
+    // Recorded unconditionally, even if the state write below fails, so a
+    // degraded (but writable-lock-file) cache dir still self-limits fetches
+    // to once per `interval` — see `fetch_recently_touched`. Touched now,
+    // before the request even starts, since the request may outlive this
+    // function's own return (see `fetch_with_render_timeout`).
+    _lock.touch();
+
     let token_owned = token.to_string();
     let claude_version_owned = claude_version.map(str::to_string);
-    let outcome = fetch_with_render_timeout(move || {
-        crate::usage_limits::fetch_usage_limits(&token_owned, claude_version_owned.as_deref())
-    });
+    let outcome = fetch_with_render_timeout(
+        move || {
+            crate::usage_limits::fetch_usage_limits(&token_owned, claude_version_owned.as_deref())
+        },
+        _lock,
+    );
     let succeeded = matches!(outcome, crate::usage_limits::UsageFetchOutcome::Success(_));
     apply_fetch_outcome(&mut state, outcome, now, interval, &fingerprint);
     if succeeded {
@@ -510,7 +489,10 @@ pub(crate) fn resolve_shared_usage(
     SharedUsageResolution {
         usage: displayable_usage(&state, &fingerprint),
     }
-    // _lock dropped here, removing the lock file
+    // The OS-level lock itself may still be held by the background thread at
+    // this point if the request timed out past the render deadline — it's
+    // released whenever that thread actually finishes. The lock file is left
+    // in place either way, as a permanent rendezvous point.
 }
 
 #[cfg(test)]
@@ -526,9 +508,16 @@ mod tests {
 
     #[test]
     fn test_fetch_with_render_timeout_returns_fast_outcome() {
-        let outcome = fetch_with_render_timeout(|| {
-            crate::usage_limits::UsageFetchOutcome::Success(Box::new(UsageLimitsData::default()))
-        });
+        let dir = tempfile::tempdir().unwrap();
+        let lock = try_acquire_fetch_lock_in(dir.path()).unwrap();
+        let outcome = fetch_with_render_timeout(
+            || {
+                crate::usage_limits::UsageFetchOutcome::Success(Box::new(
+                    UsageLimitsData::default(),
+                ))
+            },
+            lock,
+        );
         assert!(matches!(
             outcome,
             crate::usage_limits::UsageFetchOutcome::Success(_)
@@ -538,14 +527,73 @@ mod tests {
     #[test]
     #[ignore = "slow: blocks for the 2s render timeout"]
     fn test_fetch_with_render_timeout_abandons_slow_fetch() {
-        let outcome = fetch_with_render_timeout(|| {
-            std::thread::sleep(Duration::from_secs(5));
-            crate::usage_limits::UsageFetchOutcome::Success(Box::new(UsageLimitsData::default()))
-        });
+        let dir = tempfile::tempdir().unwrap();
+        let lock = try_acquire_fetch_lock_in(dir.path()).unwrap();
+        let outcome = fetch_with_render_timeout(
+            || {
+                std::thread::sleep(Duration::from_secs(5));
+                crate::usage_limits::UsageFetchOutcome::Success(Box::new(
+                    UsageLimitsData::default(),
+                ))
+            },
+            lock,
+        );
         assert!(matches!(
             outcome,
             crate::usage_limits::UsageFetchOutcome::NetworkError
         ));
+    }
+
+    /// Regression test for the lock-outliving-render-timeout bug: the OS
+    /// lock must stay held (blocking a second `try_acquire_fetch_lock_in`)
+    /// until the background thread actually finishes, not just until the
+    /// render gives up waiting on it.
+    #[test]
+    #[ignore = "slow: blocks for the 2s render timeout plus a 500ms slow fetch"]
+    fn test_fetch_with_render_timeout_keeps_lock_held_past_render_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = try_acquire_fetch_lock_in(dir.path()).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = fetch_with_render_timeout(
+                || {
+                    // Longer than RENDER_FETCH_TIMEOUT (2s) but short enough
+                    // to keep the test fast.
+                    std::thread::sleep(RENDER_FETCH_TIMEOUT + Duration::from_millis(500));
+                    crate::usage_limits::UsageFetchOutcome::Success(Box::new(
+                        UsageLimitsData::default(),
+                    ))
+                },
+                lock,
+            );
+            let _ = done_tx.send(outcome);
+        });
+
+        // Wait past the render timeout — the caller above has already
+        // "returned" its NetworkError outcome, but the real fetch (and thus
+        // the lock) is still alive.
+        std::thread::sleep(RENDER_FETCH_TIMEOUT + Duration::from_millis(100));
+        assert!(
+            try_acquire_fetch_lock_in(dir.path()).is_none(),
+            "lock must still be held while the slow fetch is in flight"
+        );
+
+        // Let the slow fetch finish and release the lock. The lock drops
+        // just after `tx.send` inside the spawned thread, a few
+        // instructions after `done_rx` receives — poll briefly rather than
+        // racing a fixed sleep against that window.
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let reacquired = (0..50).find_map(|_| {
+            let lock = try_acquire_fetch_lock_in(dir.path());
+            if lock.is_none() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            lock
+        });
+        assert!(
+            reacquired.is_some(),
+            "lock must be released once the slow fetch actually completes"
+        );
     }
 
     #[test]
@@ -963,10 +1011,10 @@ mod tests {
     }
 
     #[test]
-    fn test_load_state_or_default_when_file_missing_returns_schema_v2_default() {
+    fn test_load_state_or_default_when_file_missing_returns_schema_v3_default() {
         let dir = tempfile::tempdir().unwrap();
         let state = load_state_from_dir(dir.path());
-        assert_eq!(state.schema_version, 2);
+        assert_eq!(state.schema_version, 3);
         assert!(state.usage.is_none());
         assert_eq!(state.next_allowed_at_epoch, 0);
     }
@@ -974,9 +1022,9 @@ mod tests {
     #[test]
     fn test_load_state_or_default_when_json_invalid_returns_default() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("usage-limits-state-v2.json"), "{not json").unwrap();
+        std::fs::write(dir.path().join("usage-limits-state-v3.json"), "{not json").unwrap();
         let state = load_state_from_dir(dir.path());
-        assert_eq!(state.schema_version, 2);
+        assert_eq!(state.schema_version, 3);
         assert!(state.usage.is_none());
     }
 
@@ -984,12 +1032,12 @@ mod tests {
     fn test_load_state_or_default_when_schema_version_unknown_returns_default() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join("usage-limits-state-v2.json"),
+            dir.path().join("usage-limits-state-v3.json"),
             r#"{"schema_version":99,"token_fingerprint":null,"usage":null,"next_allowed_at_epoch":0,"rate_limit_until_epoch":0,"consecutive_errors":0,"failed_token_fingerprint":null}"#,
         )
         .unwrap();
         let state = load_state_from_dir(dir.path());
-        assert_eq!(state.schema_version, 2);
+        assert_eq!(state.schema_version, 3);
         assert!(state.usage.is_none());
     }
 
@@ -1015,7 +1063,7 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        assert_eq!(entries, vec!["usage-limits-state-v2.json"]);
+        assert_eq!(entries, vec!["usage-limits-state-v3.json"]);
     }
 
     #[test]
@@ -1026,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lock_second_process_fails_immediately() {
+    fn test_lock_concurrent_acquire_while_held_fails_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let _first = try_acquire_fetch_lock_in(dir.path()).unwrap();
         let second = try_acquire_fetch_lock_in(dir.path());
@@ -1034,84 +1082,48 @@ mod tests {
     }
 
     #[test]
-    fn test_lock_released_on_drop_can_be_reacquired() {
+    fn test_lock_released_on_drop_can_be_immediately_reacquired() {
         let dir = tempfile::tempdir().unwrap();
         {
             let _lock = try_acquire_fetch_lock_in(dir.path()).unwrap();
-        } // dropped here
+        } // dropped here — OS releases the advisory lock
         let second = try_acquire_fetch_lock_in(dir.path());
         assert!(second.is_some());
     }
 
+    /// A pre-existing lock *file* with no live lock on it (e.g. left behind
+    /// by a previous run — the file is a permanent rendezvous point, never
+    /// deleted) must not block acquisition: only a held OS lock blocks.
     #[test]
-    fn test_lock_stale_lock_is_removed_and_reacquired() {
+    fn test_lock_preexisting_unlocked_file_does_not_block() {
         let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("usage-limits-fetch.lock");
-        std::fs::write(&lock_path, "").unwrap();
-        let old = filetime::FileTime::from_system_time(
-            std::time::SystemTime::now() - std::time::Duration::from_secs(20),
-        );
-        filetime::set_file_mtime(&lock_path, old).unwrap();
-
+        std::fs::write(dir.path().join(LOCK_FILE_NAME), "leftover").unwrap();
         let lock = try_acquire_fetch_lock_in(dir.path());
         assert!(lock.is_some());
     }
 
+    /// Crash recovery: if the holding process dies without running our
+    /// `Drop` (simulated by dropping the raw locked `File` directly, never
+    /// constructing a `FetchLock`), the OS releases the lock as soon as the
+    /// descriptor closes — a new acquire succeeds with no staleness wait.
     #[test]
-    fn test_lock_fresh_lock_is_not_removed() {
+    fn test_lock_released_by_os_when_holder_crashes() {
         let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("usage-limits-fetch.lock");
-        std::fs::write(&lock_path, "").unwrap();
-        // mtime defaults to "now" — well under the 15s stale threshold.
-        let lock = try_acquire_fetch_lock_in(dir.path());
-        assert!(lock.is_none());
-    }
-
-    /// Fix 3: the exact stale-lock race. Process A acquires `lock_a`. It
-    /// stalls past the staleness window; process B reclaims the lock file
-    /// (simulated here by directly overwriting the lock file's contents with
-    /// a different owner token, exactly what `try_acquire_fetch_lock_in`'s
-    /// stale-recovery path does from a second process). Process A then
-    /// resumes and drops `lock_a` — its `Drop` must NOT delete B's
-    /// newly-reclaimed lock file, or a third process could acquire
-    /// concurrently with B, defeating mutual exclusion.
-    #[test]
-    fn test_drop_does_not_delete_a_lock_reclaimed_by_another_owner() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock_a = try_acquire_fetch_lock_in(dir.path()).unwrap();
         let lock_path = dir.path().join(LOCK_FILE_NAME);
-        assert!(lock_path.exists(), "lock_a should have created the file");
+        let crashed_holder = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        crashed_holder.try_lock().unwrap();
 
-        // Simulate B's stale-recovery: overwrite with a different owner token.
-        std::fs::write(&lock_path, "some-other-owner-token").unwrap();
+        // While "crashed_holder" is alive and holding the lock, acquisition
+        // must fail...
+        assert!(try_acquire_fetch_lock_in(dir.path()).is_none());
 
-        drop(lock_a);
-
-        assert!(
-            lock_path.exists(),
-            "lock_a's drop must not delete a lock file it no longer owns"
-        );
-        let remaining = std::fs::read_to_string(&lock_path).unwrap();
-        assert_eq!(
-            remaining, "some-other-owner-token",
-            "B's token must be untouched by A's drop"
-        );
-    }
-
-    #[test]
-    fn test_lock_stale_recovery_only_attempted_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("usage-limits-fetch.lock");
-        std::fs::write(&lock_path, "").unwrap();
-        let old = filetime::FileTime::from_system_time(
-            std::time::SystemTime::now() - std::time::Duration::from_secs(20),
-        );
-        filetime::set_file_mtime(&lock_path, old).unwrap();
-
-        let _lock = try_acquire_fetch_lock_in(dir.path()).unwrap();
-        // A second concurrent caller, same instant, must NOT also recover —
-        // the first caller already holds the (recreated) lock file.
-        let second = try_acquire_fetch_lock_in(dir.path());
-        assert!(second.is_none());
+        // ...and the moment its handle closes, the OS releases the lock.
+        drop(crashed_holder);
+        assert!(try_acquire_fetch_lock_in(dir.path()).is_some());
     }
 }
