@@ -137,6 +137,113 @@ pub(crate) fn persist_state(state: &SharedUsageState) {
     }
 }
 
+// =============================================================================
+// Cross-process fetch lock — non-blocking acquisition + stale recovery
+// =============================================================================
+
+// Not yet called from the renderer — Task 3.x (coordinator) wires these in.
+// Allowed dead code until then so `cargo clippy -D warnings` (CI) stays green.
+#[allow(dead_code)]
+const LOCK_FILE_NAME: &str = "usage-limits-fetch.lock";
+#[allow(dead_code)]
+const LOCK_STALE_AFTER_SECS: u64 = 15;
+
+#[allow(dead_code)]
+pub(crate) struct FetchLock {
+    path: PathBuf,
+    token: String,
+}
+
+impl Drop for FetchLock {
+    fn drop(&mut self) {
+        // Only remove the lock file if it still holds the token *this*
+        // instance wrote. If another process reclaimed a stale lock while
+        // this instance stalled, the file now holds a different token — in
+        // that case the lock is no longer this instance's to delete, and
+        // deleting it anyway would let a third process acquire concurrently
+        // with the reclaiming owner. A read failure (file already gone, or
+        // truly unreadable) is also treated as "not mine to delete".
+        if let Ok(contents) = std::fs::read_to_string(&self.path)
+            && contents == self.token
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Generate a per-acquisition owner token unique enough to distinguish this
+/// process/attempt from any other: process ID + current time in nanoseconds.
+/// Only needs to be unlikely-to-collide among concurrent local processes, not
+/// cryptographically unique — no new dependency required.
+fn generate_owner_token() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}", std::process::id(), nanos)
+}
+
+fn try_create_lock_file(path: &Path, token: &str) -> bool {
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut f) => f.write_all(token.as_bytes()).is_ok(),
+        Err(_) => false,
+    }
+}
+
+#[allow(dead_code)]
+fn lock_is_stale(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true; // unreadable lock file — treat as stale, safe to reclaim
+    };
+    let Ok(modified) = meta.modified() else {
+        return true; // platform doesn't support mtime — treat as stale
+    };
+    match std::time::SystemTime::now().duration_since(modified) {
+        Ok(age) => age.as_secs() > LOCK_STALE_AFTER_SECS,
+        Err(_) => false, // mtime is in the future (clock skew) — not stale
+    }
+}
+
+#[allow(dead_code)]
+fn try_acquire_fetch_lock_in(dir: &Path) -> Option<FetchLock> {
+    if std::fs::create_dir_all(dir).is_err() {
+        return None;
+    }
+    let lock_path = dir.join(LOCK_FILE_NAME);
+    let token = generate_owner_token();
+
+    if try_create_lock_file(&lock_path, &token) {
+        return Some(FetchLock {
+            path: lock_path,
+            token,
+        });
+    }
+
+    // Acquisition failed because the file exists. Recover a stale lock, then
+    // attempt exactly once more — never loop.
+    if lock_is_stale(&lock_path) {
+        let _ = std::fs::remove_file(&lock_path);
+        if try_create_lock_file(&lock_path, &token) {
+            return Some(FetchLock {
+                path: lock_path,
+                token,
+            });
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
+pub(crate) fn try_acquire_fetch_lock() -> Option<FetchLock> {
+    let dir = crate::platform::cship_shared_cache_dir()?;
+    try_acquire_fetch_lock_in(&dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +302,102 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(entries, vec!["usage-limits-state-v2.json"]);
+    }
+
+    #[test]
+    fn test_lock_first_process_acquires() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = try_acquire_fetch_lock_in(dir.path());
+        assert!(lock.is_some());
+    }
+
+    #[test]
+    fn test_lock_second_process_fails_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let _first = try_acquire_fetch_lock_in(dir.path()).unwrap();
+        let second = try_acquire_fetch_lock_in(dir.path());
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn test_lock_released_on_drop_can_be_reacquired() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _lock = try_acquire_fetch_lock_in(dir.path()).unwrap();
+        } // dropped here
+        let second = try_acquire_fetch_lock_in(dir.path());
+        assert!(second.is_some());
+    }
+
+    #[test]
+    fn test_lock_stale_lock_is_removed_and_reacquired() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("usage-limits-fetch.lock");
+        std::fs::write(&lock_path, "").unwrap();
+        let old = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(20),
+        );
+        filetime::set_file_mtime(&lock_path, old).unwrap();
+
+        let lock = try_acquire_fetch_lock_in(dir.path());
+        assert!(lock.is_some());
+    }
+
+    #[test]
+    fn test_lock_fresh_lock_is_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("usage-limits-fetch.lock");
+        std::fs::write(&lock_path, "").unwrap();
+        // mtime defaults to "now" — well under the 15s stale threshold.
+        let lock = try_acquire_fetch_lock_in(dir.path());
+        assert!(lock.is_none());
+    }
+
+    /// Fix 3: the exact stale-lock race. Process A acquires `lock_a`. It
+    /// stalls past the staleness window; process B reclaims the lock file
+    /// (simulated here by directly overwriting the lock file's contents with
+    /// a different owner token, exactly what `try_acquire_fetch_lock_in`'s
+    /// stale-recovery path does from a second process). Process A then
+    /// resumes and drops `lock_a` — its `Drop` must NOT delete B's
+    /// newly-reclaimed lock file, or a third process could acquire
+    /// concurrently with B, defeating mutual exclusion.
+    #[test]
+    fn test_drop_does_not_delete_a_lock_reclaimed_by_another_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_a = try_acquire_fetch_lock_in(dir.path()).unwrap();
+        let lock_path = dir.path().join(LOCK_FILE_NAME);
+        assert!(lock_path.exists(), "lock_a should have created the file");
+
+        // Simulate B's stale-recovery: overwrite with a different owner token.
+        std::fs::write(&lock_path, "some-other-owner-token").unwrap();
+
+        drop(lock_a);
+
+        assert!(
+            lock_path.exists(),
+            "lock_a's drop must not delete a lock file it no longer owns"
+        );
+        let remaining = std::fs::read_to_string(&lock_path).unwrap();
+        assert_eq!(
+            remaining, "some-other-owner-token",
+            "B's token must be untouched by A's drop"
+        );
+    }
+
+    #[test]
+    fn test_lock_stale_recovery_only_attempted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("usage-limits-fetch.lock");
+        std::fs::write(&lock_path, "").unwrap();
+        let old = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(20),
+        );
+        filetime::set_file_mtime(&lock_path, old).unwrap();
+
+        let _lock = try_acquire_fetch_lock_in(dir.path()).unwrap();
+        // A second concurrent caller, same instant, must NOT also recover —
+        // the first caller already holds the (recreated) lock file.
+        let second = try_acquire_fetch_lock_in(dir.path());
+        assert!(second.is_none());
     }
 }
