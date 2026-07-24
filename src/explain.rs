@@ -198,7 +198,7 @@ fn is_disabled(name: &str, cfg: &crate::config::CshipConfig) -> bool {
 
 fn error_hint_for(
     name: &str,
-    ctx: &crate::context::Context,
+    _ctx: &crate::context::Context,
     cfg: &crate::config::CshipConfig,
 ) -> (String, String) {
     let top = name.strip_prefix("cship.").unwrap_or(name);
@@ -262,11 +262,11 @@ fn error_hint_for(
                     //   2. Enterprise main token with extra_usage disabled — plan has
                     //      neither usage windows nor extra credits.
                     //   3. Anything else — fall back to the legacy "fetch failed" hint.
-                    let cached = ctx
-                        .transcript_path
-                        .as_deref()
-                        .map(std::path::Path::new)
-                        .and_then(|p| crate::cache::read_usage_limits(p, true, None));
+                    // Best-effort diagnostic read of the shared coordinator's last
+                    // known data (no fingerprint check here — this is informational
+                    // only, distinguishing "plan lacks this data" from "fetch
+                    // failed" for the hint text below, not rendering output).
+                    let cached = crate::usage_limits_state::load_state_or_default().usage;
                     let is_per_model_subtoken = matches!(
                         top,
                         "usage_limits.per_model"
@@ -668,100 +668,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_enterprise_no_extra_credits_hint() {
-        // Cache holds a successfully-fetched payload with no signal at all.
-        // get_oauth_token() succeeds (covered by environment in real runs);
-        // here we exercise the inner branch by priming the cache and calling
-        // error_hint_for with a transcript_path pointing at it.
-        let tmp = tempfile::tempdir().unwrap();
-        let transcript_path = tmp.path().join("transcript.jsonl");
-        std::fs::write(&transcript_path, "").unwrap();
-
-        let empty = crate::usage_limits::UsageLimitsData::default();
-        crate::cache::write_usage_limits(&transcript_path, &empty, 600, None);
-
-        let ctx = crate::context::Context {
-            transcript_path: Some(transcript_path.to_string_lossy().into()),
-            ..Default::default()
-        };
-        let cfg = crate::config::CshipConfig::default();
-
-        // Skip if no real OAuth credential is present in the environment;
-        // the hint we want exercises the `Ok(_)` arm. CI runs without a
-        // credential, so we guard with the same probe used by error_hint_for.
-        if crate::platform::get_oauth_token().is_err() {
-            return;
-        }
-
-        let (msg, hint) = error_hint_for("usage_limits", &ctx, &cfg);
-        assert!(
-            msg.contains("plan reports no usage windows or extra credits"),
-            "unexpected msg: {msg}"
-        );
-        assert!(
-            hint.contains("Claude Enterprise"),
-            "unexpected hint: {hint}"
-        );
-    }
-
-    #[test]
-    fn test_enterprise_per_model_subtoken_hint() {
-        // On Enterprise plans the per-model sub-tokens are inherently absent —
-        // they should produce a dedicated hint, not the misleading "fetch
-        // failed" message.
-        let tmp = tempfile::tempdir().unwrap();
-        let transcript_path = tmp.path().join("transcript.jsonl");
-        std::fs::write(&transcript_path, "").unwrap();
-
-        let enterprise = crate::usage_limits::UsageLimitsData {
-            extra_usage_enabled: Some(true),
-            extra_usage_monthly_limit: Some(20000.0),
-            extra_usage_used_credits: Some(7000.0),
-            extra_usage_utilization: Some(35.0),
-            ..Default::default()
-        };
-        crate::cache::write_usage_limits(&transcript_path, &enterprise, 600, None);
-
-        let ctx = crate::context::Context {
-            transcript_path: Some(transcript_path.to_string_lossy().into()),
-            ..Default::default()
-        };
-        let cfg = crate::config::CshipConfig::default();
-
-        // OAuth probes via macOS `security` / Linux `secret-tool` subprocesses
-        // are flaky under parallel test execution — each iteration probes
-        // independently and only asserts on iterations that landed in the
-        // `Ok(_)` branch of `error_hint_for`.
-        let mut asserted_at_least_once = false;
-        for token in [
-            "cship.usage_limits.per_model",
-            "cship.usage_limits.opus",
-            "cship.usage_limits.sonnet",
-            "cship.usage_limits.cowork",
-            "cship.usage_limits.oauth_apps",
-        ] {
-            if crate::platform::get_oauth_token().is_err() {
-                continue;
-            }
-            let (msg, hint) = error_hint_for(token, &ctx, &cfg);
-            // Tolerate iterations where OAuth flipped to Err between the probe
-            // above and the inner probe inside error_hint_for.
-            if msg.contains("credential") {
-                continue;
-            }
-            assert!(
-                msg.contains("per-model breakdowns are unavailable"),
-                "{token}: unexpected msg: {msg}"
-            );
-            assert!(
-                hint.contains("monthly credits"),
-                "{token}: unexpected hint: {hint}"
-            );
-            asserted_at_least_once = true;
-        }
-        // If every iteration's OAuth probe was unreliable, the test is
-        // a no-op — same trade-off as the sibling test above.
-        let _ = asserted_at_least_once;
-    }
+    // Note: `test_enterprise_no_extra_credits_hint` and
+    // `test_enterprise_per_model_subtoken_hint` were removed in the Task 4.4
+    // coordinator rewire. Both primed the old transcript-scoped
+    // `cache::write_usage_limits` cache that `error_hint_for`'s `usage_limits`
+    // arm read from; that read now goes through
+    // `usage_limits_state::load_state_or_default()`, which resolves its
+    // directory from `CLAUDE_CONFIG_DIR`/`HOME`/`USERPROFILE`. Priming it in a
+    // test would mean mutating those process-global env vars, which
+    // `platform.rs`'s own test comments document as having intermittently
+    // broken an unrelated test on a machine with real Claude Code credentials
+    // on disk. Both removed tests also only ever asserted when a real OAuth
+    // credential was present in the environment (a no-op in CI), so this is
+    // not a loss of CI-meaningful coverage; the underlying branch logic
+    // (`lacks_standard_signal` + the per-model-subtoken match) remains
+    // covered by `modules::usage_limits::tests`.
 }

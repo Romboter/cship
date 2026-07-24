@@ -135,7 +135,7 @@ fn parse_api_response(json: &str) -> Result<UsageLimitsData, String> {
 /// only classifies what happened on the wire.
 #[derive(Debug)]
 pub enum UsageFetchOutcome {
-    Success(UsageLimitsData),
+    Success(Box<UsageLimitsData>),
     Unauthorized,
     RateLimited { retry_after_seconds: Option<u64> },
     ServerError { status: u16 },
@@ -205,7 +205,7 @@ pub fn fetch_usage_limits(token: &str, claude_version: Option<&str>) -> UsageFet
         return UsageFetchOutcome::InvalidResponse;
     };
     match parse_api_response(&body) {
-        Ok(data) => UsageFetchOutcome::Success(data),
+        Ok(data) => UsageFetchOutcome::Success(Box::new(data)),
         Err(_) => UsageFetchOutcome::InvalidResponse,
     }
 }

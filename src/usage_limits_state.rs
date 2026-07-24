@@ -13,6 +13,7 @@
 
 use crate::usage_limits::UsageLimitsData;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const STATE_FILE_NAME: &str = "usage-limits-state-v2.json";
 const CURRENT_SCHEMA_VERSION: u32 = 2;
@@ -313,7 +314,7 @@ fn apply_fetch_outcome(
     match outcome {
         UsageFetchOutcome::Success(data) => {
             let reset = earliest_future_reset(&data, now);
-            state.usage = Some(data);
+            state.usage = Some(*data);
             let ordinary_next = now + api_interval;
             state.next_allowed_at_epoch = match reset {
                 Some(r)
@@ -381,6 +382,39 @@ fn displayable_usage(state: &SharedUsageState, fingerprint: &str) -> Option<Usag
         state.usage.clone()
     } else {
         None
+    }
+}
+
+/// Render invocations must never stall waiting on the network — a slow or
+/// unreachable API would otherwise block every eligible statusline render.
+const RENDER_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Runs `fetch_fn` on a worker thread and waits up to `RENDER_FETCH_TIMEOUT`
+/// for it to reply, bounding how long a render can stall regardless of the
+/// HTTP client's own (longer) internal timeout. If the worker hasn't replied
+/// in time, its result is abandoned — the thread keeps running in the
+/// background, but this call reports `NetworkError` so the caller applies
+/// the same backoff as any other transient failure (`apply_fetch_outcome`'s
+/// `TRANSIENT_ERROR_RETRY_SECS`), instead of re-attempting the same slow
+/// endpoint on the very next render. Generic `F` bound allows tests to
+/// inject a fast lambda bypassing real HTTP.
+fn fetch_with_render_timeout<F>(fetch_fn: F) -> crate::usage_limits::UsageFetchOutcome
+where
+    F: FnOnce() -> crate::usage_limits::UsageFetchOutcome + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(fetch_fn());
+    });
+    match rx.recv_timeout(RENDER_FETCH_TIMEOUT) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            tracing::warn!(
+                "cship.usage_limits_state: API fetch timed out after {}s",
+                RENDER_FETCH_TIMEOUT.as_secs()
+            );
+            crate::usage_limits::UsageFetchOutcome::NetworkError
+        }
     }
 }
 
@@ -453,7 +487,11 @@ pub(crate) fn resolve_shared_usage(
         };
     }
 
-    let outcome = crate::usage_limits::fetch_usage_limits(token, claude_version);
+    let token_owned = token.to_string();
+    let claude_version_owned = claude_version.map(str::to_string);
+    let outcome = fetch_with_render_timeout(move || {
+        crate::usage_limits::fetch_usage_limits(&token_owned, claude_version_owned.as_deref())
+    });
     let succeeded = matches!(outcome, crate::usage_limits::UsageFetchOutcome::Success(_));
     apply_fetch_outcome(&mut state, outcome, now, interval, &fingerprint);
     if succeeded {
@@ -484,6 +522,30 @@ mod tests {
         let mut s = SharedUsageState::default_v2();
         s.next_allowed_at_epoch = now; // eligible immediately unless overridden
         s
+    }
+
+    #[test]
+    fn test_fetch_with_render_timeout_returns_fast_outcome() {
+        let outcome = fetch_with_render_timeout(|| {
+            crate::usage_limits::UsageFetchOutcome::Success(Box::new(UsageLimitsData::default()))
+        });
+        assert!(matches!(
+            outcome,
+            crate::usage_limits::UsageFetchOutcome::Success(_)
+        ));
+    }
+
+    #[test]
+    #[ignore = "slow: blocks for the 2s render timeout"]
+    fn test_fetch_with_render_timeout_abandons_slow_fetch() {
+        let outcome = fetch_with_render_timeout(|| {
+            std::thread::sleep(Duration::from_secs(5));
+            crate::usage_limits::UsageFetchOutcome::Success(Box::new(UsageLimitsData::default()))
+        });
+        assert!(matches!(
+            outcome,
+            crate::usage_limits::UsageFetchOutcome::NetworkError
+        ));
     }
 
     #[test]
@@ -538,7 +600,7 @@ mod tests {
         let data = UsageLimitsData::default();
         apply_fetch_outcome(
             &mut state,
-            crate::usage_limits::UsageFetchOutcome::Success(data),
+            crate::usage_limits::UsageFetchOutcome::Success(Box::new(data)),
             now,
             180,
             "fp-1",
