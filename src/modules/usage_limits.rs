@@ -272,6 +272,10 @@ fn resolve_data_uncached(ctx: &Context, cfg: &CshipConfig) -> Option<UsageLimits
             // (whose non-window fields are all `Default`) when `full` is
             // absent, so the arm still produces a value in the
             // single-source stdin-only case.
+            let five_hour_available = stdin.as_ref().is_some_and(|d| d.five_hour_available)
+                || full.as_ref().is_some_and(|d| d.five_hour_available);
+            let seven_day_available = stdin.as_ref().is_some_and(|d| d.seven_day_available)
+                || full.as_ref().is_some_and(|d| d.seven_day_available);
             let base = full.unwrap_or_else(|| stdin.unwrap_or_default());
             Some(UsageLimitsData {
                 five_hour_pct: five_h.pct,
@@ -280,33 +284,33 @@ fn resolve_data_uncached(ctx: &Context, cfg: &CshipConfig) -> Option<UsageLimits
                 seven_day_resets_at: seven_d.resets_at_iso,
                 five_hour_resets_at_epoch: five_h.resets_at_epoch,
                 seven_day_resets_at_epoch: seven_d.resets_at_epoch,
+                five_hour_available,
+                seven_day_available,
                 ..base
             })
         }
     }
 }
 
-/// True when the response carries no 5h or 7d signal — i.e. percentages and
-/// reset markers are all at their `Default` zero state. On Claude Enterprise
-/// the API returns these fields as `null`, so they remain at default values
-/// after `parse_api_response`. Used to switch the renderer into "extra-usage
-/// only" mode.
+/// True when neither source ever carried a 5h or 7d window at all — i.e. on
+/// Claude Enterprise, where the API returns these fields as `null`/absent.
+/// Used to switch the renderer into "extra-usage only" mode.
 ///
-/// Safe to check these four fields directly because `resolve_data_uncached`'s
-/// merge always produces a pct/epoch/iso triple from a single source — never
-/// a pct from one source paired with a reset from another.
+/// Checks presence (`*_available`), not value: a normal account whose 5h
+/// window just reset reports `{utilization: 0, resets_at: null}` — present,
+/// just idle — and must still render as a normal zero-usage window rather
+/// than being mistaken for a plan where standard windows don't exist.
 pub(crate) fn lacks_standard_signal(data: &UsageLimitsData) -> bool {
-    data.five_hour_pct == 0.0
-        && data.seven_day_pct == 0.0
-        && data.five_hour_resets_at_epoch.is_none()
-        && data.seven_day_resets_at_epoch.is_none()
-        && data.five_hour_resets_at.is_empty()
-        && data.seven_day_resets_at.is_empty()
+    !data.five_hour_available && !data.seven_day_available
 }
 
 /// Apply threshold styling using the higher of 5h/7d utilization.
-/// Falls back to `extra_usage_utilization` when both standard signals are zero
-/// (Enterprise plans where 5h/7d data is absent).
+/// Falls back to `extra_usage_utilization` whenever both standard percentages
+/// are zero — either because neither window is available (Enterprise plans,
+/// where 5h/7d data is absent) or because a normal account's windows are
+/// genuinely idle at 0%. `lacks_standard_signal` is presence-based and not
+/// checked here; this fallback is purely value-based, so it applies in both
+/// cases.
 fn apply_threshold(content: &str, data: &UsageLimitsData, cfg: &CshipConfig) -> String {
     let ul_cfg = cfg.usage_limits.as_ref();
     let standard_max = data.five_hour_pct.max(data.seven_day_pct);
@@ -465,6 +469,8 @@ fn data_from_stdin_rate_limits(ctx: &Context) -> Option<UsageLimitsData> {
         seven_day_pct: seven_pct,
         five_hour_resets_at_epoch: five_epoch,
         seven_day_resets_at_epoch: seven_epoch,
+        five_hour_available: rl.five_hour.is_some(),
+        seven_day_available: rl.seven_day.is_some(),
         ..Default::default()
     })
 }
@@ -846,6 +852,8 @@ mod tests {
             seven_day_pct: 45.1,
             five_hour_resets_at: "2099-01-01T00:00:00Z".into(),
             seven_day_resets_at: "2099-01-01T00:00:00Z".into(),
+            five_hour_available: true,
+            seven_day_available: true,
             ..Default::default()
         }
     }
@@ -859,30 +867,60 @@ mod tests {
     }
 
     #[test]
-    fn test_lacks_standard_signal_returns_false_when_pct_set() {
+    fn test_lacks_standard_signal_returns_false_when_five_hour_available() {
         let data = UsageLimitsData {
             five_hour_pct: 1.0,
+            five_hour_available: true,
             ..Default::default()
         };
         assert!(!lacks_standard_signal(&data));
     }
 
     #[test]
-    fn test_lacks_standard_signal_returns_false_when_reset_iso_set() {
+    fn test_lacks_standard_signal_returns_false_when_seven_day_available() {
         let data = UsageLimitsData {
             seven_day_resets_at: "2099-01-01T00:00:00+00:00".into(),
+            seven_day_available: true,
             ..Default::default()
         };
         assert!(!lacks_standard_signal(&data));
     }
 
     #[test]
-    fn test_lacks_standard_signal_returns_false_when_reset_epoch_set() {
+    fn test_lacks_standard_signal_returns_false_when_only_epoch_and_available_set() {
         let data = UsageLimitsData {
             five_hour_resets_at_epoch: Some(1_700_000_000),
+            five_hour_available: true,
             ..Default::default()
         };
         assert!(!lacks_standard_signal(&data));
+    }
+
+    #[test]
+    fn test_lacks_standard_signal_returns_false_for_idle_but_available_window() {
+        // The core regression case: a supported window that just reset
+        // (utilization 0, resets_at null) is still `available` — must not be
+        // mistaken for a plan where the window doesn't exist (Enterprise).
+        let data = UsageLimitsData {
+            five_hour_pct: 0.0,
+            seven_day_pct: 62.0,
+            five_hour_available: true,
+            seven_day_available: true,
+            ..Default::default()
+        };
+        assert!(!lacks_standard_signal(&data));
+    }
+
+    #[test]
+    fn test_lacks_standard_signal_returns_true_when_unavailable_despite_stale_pct() {
+        // Presence, not value, is authoritative: even if a pct/reset value is
+        // (incorrectly) populated without the available flag, absence wins.
+        let data = UsageLimitsData {
+            five_hour_pct: 1.0,
+            five_hour_available: false,
+            ..Default::default()
+        };
+        assert!(lacks_standard_signal(&data));
     }
 
     // ── render() tests ────────────────────────────────────────────────────────
@@ -1900,6 +1938,8 @@ mod tests {
             seven_day_pct: 40.0,
             five_hour_resets_at: "2099-01-01T00:00:00Z".into(),
             seven_day_resets_at: "2099-01-01T00:00:00Z".into(),
+            five_hour_available: true,
+            seven_day_available: true,
             extra_usage_enabled: Some(true),
             extra_usage_monthly_limit: Some(20000.0),
             extra_usage_used_credits: Some(1000.0),

@@ -20,6 +20,16 @@ pub struct UsageLimitsData {
     pub seven_day_pct: f64,
     pub five_hour_resets_at: String, // ISO 8601; empty string when API returns null
     pub seven_day_resets_at: String, // ISO 8601; empty string when API returns null
+    /// Whether the source actually carried a `five_hour` window (vs. it being
+    /// `null`/absent, e.g. on Enterprise plans). A supported-but-idle window
+    /// (`{utilization: 0, resets_at: null}`) is still `true` — only a missing
+    /// key/`null` object is `false`. Distinguishes "no data" from "zero data"
+    /// so `lacks_standard_signal` doesn't mistake one for the other.
+    #[serde(default)]
+    pub five_hour_available: bool,
+    /// Same as `five_hour_available`, for the `seven_day` window.
+    #[serde(default)]
+    pub seven_day_available: bool,
     /// Unix epoch seconds for the five-hour window reset; `Some` only on the stdin path.
     #[serde(default)]
     pub five_hour_resets_at_epoch: Option<u64>,
@@ -99,6 +109,9 @@ fn parse_api_response(json: &str) -> Result<UsageLimitsData, String> {
     let (cowork_pct, cowork_reset) = map_period(&api.seven_day_cowork);
     let (oauth_apps_pct, oauth_apps_reset) = map_period(&api.seven_day_oauth_apps);
 
+    let five_hour_available = api.five_hour.is_some();
+    let seven_day_available = api.seven_day.is_some();
+
     let (five_h_pct, five_h_reset) = api
         .five_hour
         .map(|p| (p.utilization, p.resets_at.unwrap_or_default()))
@@ -115,6 +128,8 @@ fn parse_api_response(json: &str) -> Result<UsageLimitsData, String> {
         seven_day_resets_at: seven_d_reset,
         five_hour_resets_at_epoch: None,
         seven_day_resets_at_epoch: None,
+        five_hour_available,
+        seven_day_available,
         extra_usage_enabled: api.extra_usage.as_ref().and_then(|e| e.is_enabled),
         extra_usage_monthly_limit: api.extra_usage.as_ref().and_then(|e| e.monthly_limit),
         extra_usage_used_credits: api.extra_usage.as_ref().and_then(|e| e.used_credits),
@@ -361,10 +376,48 @@ mod tests {
         assert_eq!(data.seven_day_pct, 0.0);
         assert!(data.five_hour_resets_at.is_empty());
         assert!(data.seven_day_resets_at.is_empty());
+        assert!(!data.five_hour_available);
+        assert!(!data.seven_day_available);
         assert_eq!(data.extra_usage_enabled, Some(true));
         assert_eq!(data.extra_usage_monthly_limit, Some(20000.0));
         assert!((data.extra_usage_used_credits.unwrap() - 19411.0).abs() < f64::EPSILON);
         assert!((data.extra_usage_utilization.unwrap() - 97.055).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_five_hour_idle_after_reset_is_distinguished_from_enterprise_shape() {
+        // Real capture taken seconds after a 5h window reset (2026-07-15, session
+        // 6318e733). `five_hour` is `Some({utilization: 0.0, resets_at: null})` here,
+        // not `None` — same (0.0, "") tuple as the Enterprise `five_hour: null` case
+        // above, but `five_hour_available` now records that the window was actually
+        // present, so `lacks_standard_signal` won't mistake this idle-but-real window
+        // for a plan where the 5h window doesn't exist at all.
+        let json = r#"{
+            "five_hour": {"utilization": 0.0, "resets_at": null},
+            "seven_day": {"utilization": 62.0, "resets_at": "2026-07-17T15:59:59.793231+00:00"},
+            "extra_usage": {"is_enabled": false}
+        }"#;
+        let data = parse_api_response(json).expect("idle five_hour must still parse");
+        assert_eq!(data.five_hour_pct, 0.0);
+        assert!(data.five_hour_resets_at.is_empty());
+        assert!(data.five_hour_available);
+        assert!(data.seven_day_available);
+        // seven_day is untouched by the reset and still carries real signal.
+        assert!((data.seven_day_pct - 62.0).abs() < f64::EPSILON);
+        assert_eq!(data.seven_day_resets_at, "2026-07-17T15:59:59.793231+00:00");
+    }
+
+    #[test]
+    fn test_parse_five_hour_active_window_is_distinguishable() {
+        // Contrast case from the same session, ~15 minutes earlier: five_hour
+        // mid-window with real utilization and a real reset timestamp.
+        let json = r#"{
+            "five_hour": {"utilization": 26.0, "resets_at": "2026-07-15T12:09:59.528964+00:00"},
+            "seven_day": {"utilization": 62.0, "resets_at": "2026-07-17T15:59:59.528995+00:00"}
+        }"#;
+        let data = parse_api_response(json).expect("active window must parse");
+        assert!((data.five_hour_pct - 26.0).abs() < f64::EPSILON);
+        assert_eq!(data.five_hour_resets_at, "2026-07-15T12:09:59.528964+00:00");
     }
 
     #[test]
